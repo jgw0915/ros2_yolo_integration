@@ -63,6 +63,16 @@ class YoloDetectionNode(Node):
         self.declare_parameter("bridge_side_max_pair_width_m", 2.5)
         self.declare_parameter("bridge_side_projection_min_valid_pairs", 4)
         self.declare_parameter("bridge_side_depth_patch_radius", 4)
+        self.declare_parameter("drivable_corridor_enable", True)
+        self.declare_parameter("drivable_corridor_bottom_y_ratio", 0.88)
+        self.declare_parameter("drivable_corridor_lower_y_ratio", 0.70)
+        self.declare_parameter("drivable_corridor_center_y_ratio", 0.50)
+        self.declare_parameter("drivable_corridor_center_band_height_ratio", 0.06)
+        self.declare_parameter("drivable_corridor_min_bottom_width_ratio", 0.12)
+        self.declare_parameter("drivable_corridor_min_center_width_ratio", 0.08)
+        self.declare_parameter("drivable_corridor_min_continuous_score", 0.55)
+        self.declare_parameter("drivable_corridor_center_tolerance_pixels", 45.0)
+        self.declare_parameter("drivable_corridor_max_slope_pixels", 140.0)
 
         # 初始化 cv_bridge
         self.bridge = CvBridge()
@@ -93,6 +103,38 @@ class YoloDetectionNode(Node):
             self.get_parameter("segmentation_connection_dilation_pixels")
             .get_parameter_value()
             .integer_value
+        )
+        self.drivable_corridor_enable = (
+            self.get_parameter("drivable_corridor_enable")
+            .get_parameter_value()
+            .bool_value
+        )
+        self.drivable_corridor_bottom_y_ratio = self._double_param(
+            "drivable_corridor_bottom_y_ratio"
+        )
+        self.drivable_corridor_lower_y_ratio = self._double_param(
+            "drivable_corridor_lower_y_ratio"
+        )
+        self.drivable_corridor_center_y_ratio = self._double_param(
+            "drivable_corridor_center_y_ratio"
+        )
+        self.drivable_corridor_center_band_height_ratio = self._double_param(
+            "drivable_corridor_center_band_height_ratio"
+        )
+        self.drivable_corridor_min_bottom_width_ratio = self._double_param(
+            "drivable_corridor_min_bottom_width_ratio"
+        )
+        self.drivable_corridor_min_center_width_ratio = self._double_param(
+            "drivable_corridor_min_center_width_ratio"
+        )
+        self.drivable_corridor_min_continuous_score = self._double_param(
+            "drivable_corridor_min_continuous_score"
+        )
+        self.drivable_corridor_center_tolerance_pixels = self._double_param(
+            "drivable_corridor_center_tolerance_pixels"
+        )
+        self.drivable_corridor_max_slope_pixels = self._double_param(
+            "drivable_corridor_max_slope_pixels"
         )
         self.target_lock_enabled = (
             self.get_parameter("target_lock_enabled").get_parameter_value().bool_value
@@ -334,6 +376,12 @@ class YoloDetectionNode(Node):
             self.segmentation_info_pub = self.create_publisher(
                 Float32MultiArray, "/yolo/segmentation_info", 10
             )
+            self.drivable_corridor_pub = self.create_publisher(
+                Float32MultiArray, "/yolo/drivable_corridor_info", 10
+            )
+            self.drivable_corridor_debug_pub = self.create_publisher(
+                String, "/yolo/drivable_corridor_debug", 10
+            )
 
         # 發布 目標檢測數據 (是否找到目標 + 距離)
         self.target_pub = self.create_publisher(
@@ -392,6 +440,9 @@ class YoloDetectionNode(Node):
             .string_array_value
             if label.strip()
         }
+
+    def _double_param(self, name):
+        return self.get_parameter(name).get_parameter_value().double_value
 
     def camera_info_callback(self, msg):
         if len(msg.k) >= 9 and msg.k[0] > 0.0 and msg.k[4] > 0.0:
@@ -769,6 +820,11 @@ class YoloDetectionNode(Node):
                     mask_colored[mask_bool] = color
                     mask_image = cv2.addWeighted(mask_image, 1, mask_colored, 0.5, 0)
 
+        corridor = self._compute_drivable_corridor(road_mask, bridge_mask)
+        if self.drivable_corridor_enable:
+            self.publish_drivable_corridor_info(corridor)
+            self.publish_drivable_corridor_debug(corridor)
+            mask_image = self._draw_drivable_corridor_overlay(mask_image, corridor)
         self.publish_segmentation_info(road_mask, bridge_mask, header=header)
         self.publish_target_surface_info(self.current_frame_target, bridge_mask)
         self.publish_bridge_geometry(road_mask, bridge_mask, header)
@@ -830,6 +886,346 @@ class YoloDetectionNode(Node):
                 )
         except Exception as e:
             self.get_logger().error(f"Could not publish segmentation image: {e}")
+
+    def _compute_drivable_corridor(self, road_mask, bridge_mask):
+        height, width = road_mask.shape
+        center_x = width * 0.5
+        empty = {
+            "corridor_valid": False,
+            "bottom_connected": False,
+            "centerline_reached": False,
+            "upper_mid_reached": False,
+            "continuous_score": 0.0,
+            "bottom_width_ratio": 0.0,
+            "center_width_ratio": 0.0,
+            "corridor_center_x_bottom": 0.0,
+            "corridor_center_x_mid": 0.0,
+            "corridor_center_x_centerline": 0.0,
+            "corridor_error_x_pixels": 0.0,
+            "corridor_slope_pixels": 0.0,
+            "road_ratio_in_corridor": 0.0,
+            "bridge_ratio_in_corridor": 0.0,
+            "drivable_type": 0.0,
+            "side_view_likely": False,
+            "image_width": float(width),
+            "image_height": float(height),
+            "reason_code": 1.0,
+            "reason": "no drivable mask",
+            "component_mask": np.zeros((height, width), dtype=bool),
+            "bands": {},
+        }
+        if height <= 0 or width <= 0:
+            return empty
+
+        road_mask = road_mask.astype(bool)
+        bridge_mask = bridge_mask.astype(bool)
+        drivable_mask = road_mask | bridge_mask
+        if int(np.count_nonzero(drivable_mask)) <= 0:
+            return empty
+
+        labels, label_img, stats, _ = cv2.connectedComponentsWithStats(
+            drivable_mask.astype(np.uint8), 8
+        )
+        bottom_y = self._clamped_row(height, self.drivable_corridor_bottom_y_ratio)
+        lower_y = self._clamped_row(height, self.drivable_corridor_lower_y_ratio)
+        center_y = self._clamped_row(height, self.drivable_corridor_center_y_ratio)
+        band_half = max(
+            2,
+            int(height * max(0.01, self.drivable_corridor_center_band_height_ratio) * 0.5),
+        )
+        center_band = (max(0, center_y - band_half), min(height, center_y + band_half + 1))
+        bottom_band = (bottom_y, height)
+        lower_band = (lower_y, min(height, max(lower_y + 1, bottom_y + band_half)))
+        upper_mid_band = (
+            max(0, int(height * 0.35)),
+            min(height, max(int(height * 0.35) + 1, int(height * 0.48))),
+        )
+
+        best = None
+        min_area = max(20, int(width * height * 0.0015))
+        for label in range(1, labels):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            if area < min_area:
+                continue
+            component = label_img == label
+            bottom = self._drivable_band_stats(component, *bottom_band)
+            lower = self._drivable_band_stats(component, *lower_band)
+            center = self._drivable_band_stats(component, *center_band)
+            upper_mid = self._drivable_band_stats(component, *upper_mid_band)
+            touches_bottom = bottom["width"] > 0.0
+            reaches_center = center["width"] > 0.0
+            center_overlap_score = max(
+                0.0,
+                1.0 - abs((bottom["center_x"] or lower["center_x"] or center["center_x"]) - center_x)
+                / max(1.0, width * 0.45),
+            )
+            vertical_span = int(stats[label, cv2.CC_STAT_HEIGHT])
+            score = (
+                area
+                + (width * height * 0.25 if touches_bottom else 0.0)
+                + (width * height * 0.18 if reaches_center else 0.0)
+                + vertical_span * width * 0.08
+                + center_overlap_score * width * height * 0.10
+            )
+            if best is None or score > best["score"]:
+                best = {
+                    "label": label,
+                    "component": component,
+                    "score": score,
+                    "area": area,
+                    "bottom": bottom,
+                    "lower": lower,
+                    "center": center,
+                    "upper_mid": upper_mid,
+                }
+
+        if best is None:
+            result = dict(empty)
+            result["reason"] = "no usable drivable component"
+            result["reason_code"] = 1.0
+            return result
+
+        component = best["component"]
+        bottom = best["bottom"]
+        lower = best["lower"]
+        center = best["center"]
+        upper_mid = best["upper_mid"]
+        bottom_connected = bottom["width"] > 0.0
+        centerline_reached = center["width"] > 0.0
+        upper_mid_reached = upper_mid["width"] > 0.0
+        bottom_center = bottom["center_x"] if bottom["width"] > 0.0 else lower["center_x"]
+        if bottom_center <= 0.0:
+            bottom_center = center["center_x"]
+        mid_center = lower["center_x"] if lower["width"] > 0.0 else bottom_center
+        centerline_center = center["center_x"] if center["width"] > 0.0 else mid_center
+        error_x = centerline_center - center_x
+        slope = centerline_center - bottom_center
+        row_has_pixels = np.any(component, axis=1)
+        ys = np.flatnonzero(row_has_pixels)
+        continuous_score = 0.0
+        if len(ys) > 0:
+            span_start = min(int(ys[0]), center_band[0])
+            span_end = max(int(ys[-1]) + 1, bottom_band[1])
+            span_rows = max(1, span_end - span_start)
+            continuous_score = float(
+                np.count_nonzero(row_has_pixels[span_start:span_end]) / span_rows
+            )
+
+        component_area = max(1, int(np.count_nonzero(component)))
+        road_ratio = float(np.count_nonzero(component & road_mask) / component_area)
+        bridge_ratio = float(np.count_nonzero(component & bridge_mask) / component_area)
+        if road_ratio >= 0.20 and bridge_ratio >= 0.20:
+            drivable_type = 3.0
+        elif bridge_ratio > road_ratio:
+            drivable_type = 2.0
+        elif road_ratio > 0.0:
+            drivable_type = 1.0
+        else:
+            drivable_type = 0.0
+
+        side_view_likely = bool(
+            abs(error_x) > width * 0.42
+            or abs(slope) > self.drivable_corridor_max_slope_pixels
+            or (
+                bottom_connected
+                and bottom["width_ratio"] < self.drivable_corridor_min_bottom_width_ratio * 0.7
+                and abs(bottom_center - center_x) > width * 0.25
+            )
+            or (
+                centerline_reached
+                and center["width_ratio"] < self.drivable_corridor_min_center_width_ratio * 0.7
+                and abs(centerline_center - center_x) > width * 0.25
+            )
+        )
+        valid = (
+            bottom_connected
+            and centerline_reached
+            and continuous_score >= self.drivable_corridor_min_continuous_score
+            and bottom["width_ratio"] >= self.drivable_corridor_min_bottom_width_ratio
+            and center["width_ratio"] >= self.drivable_corridor_min_center_width_ratio
+            and not side_view_likely
+        )
+        reason = "valid drivable corridor"
+        reason_code = 0.0
+        if not bottom_connected:
+            reason = "drivable mask does not touch lower frame"
+            reason_code = 2.0
+        elif not centerline_reached:
+            reason = "drivable component does not reach center line"
+            reason_code = 3.0
+        elif bottom["width_ratio"] < self.drivable_corridor_min_bottom_width_ratio:
+            reason = "bottom corridor too narrow"
+            reason_code = 4.0
+        elif center["width_ratio"] < self.drivable_corridor_min_center_width_ratio:
+            reason = "center corridor too narrow"
+            reason_code = 4.0
+        elif continuous_score < self.drivable_corridor_min_continuous_score:
+            reason = "corridor is not vertically continuous"
+            reason_code = 5.0
+        elif side_view_likely:
+            reason = "side-view or sharply slanted corridor likely"
+            reason_code = 6.0
+
+        return {
+            "corridor_valid": bool(valid),
+            "bottom_connected": bool(bottom_connected),
+            "centerline_reached": bool(centerline_reached),
+            "upper_mid_reached": bool(upper_mid_reached),
+            "continuous_score": float(continuous_score),
+            "bottom_width_ratio": float(bottom["width_ratio"]),
+            "center_width_ratio": float(center["width_ratio"]),
+            "corridor_center_x_bottom": float(bottom_center),
+            "corridor_center_x_mid": float(mid_center),
+            "corridor_center_x_centerline": float(centerline_center),
+            "corridor_error_x_pixels": float(error_x),
+            "corridor_slope_pixels": float(slope),
+            "road_ratio_in_corridor": float(road_ratio),
+            "bridge_ratio_in_corridor": float(bridge_ratio),
+            "drivable_type": float(drivable_type),
+            "side_view_likely": bool(side_view_likely),
+            "image_width": float(width),
+            "image_height": float(height),
+            "reason_code": float(reason_code),
+            "reason": reason,
+            "component_mask": component,
+            "bands": {
+                "bottom": bottom_band,
+                "lower": lower_band,
+                "center": center_band,
+                "upper_mid": upper_mid_band,
+            },
+        }
+
+    def _clamped_row(self, height, ratio):
+        if height <= 0:
+            return 0
+        ratio = max(0.0, min(0.99, float(ratio)))
+        return max(0, min(height - 1, int(height * ratio)))
+
+    def _drivable_band_stats(self, mask, y_start, y_end):
+        height, width = mask.shape
+        y_start = max(0, min(height, int(y_start)))
+        y_end = max(y_start, min(height, int(y_end)))
+        if y_end <= y_start or width <= 0:
+            return {"center_x": 0.0, "width": 0.0, "width_ratio": 0.0}
+        xs = []
+        row_widths = []
+        min_pixels_per_row = max(2, int(width * 0.006))
+        for row in mask[y_start:y_end, :]:
+            row_xs = np.flatnonzero(row)
+            if len(row_xs) < min_pixels_per_row:
+                continue
+            xs.extend(row_xs.tolist())
+            row_widths.append(float(row_xs[-1] - row_xs[0] + 1))
+        if not xs or not row_widths:
+            return {"center_x": 0.0, "width": 0.0, "width_ratio": 0.0}
+        width_px = float(np.median(row_widths))
+        return {
+            "center_x": float(np.median(xs)),
+            "width": width_px,
+            "width_ratio": float(width_px / max(1, width)),
+        }
+
+    def publish_drivable_corridor_info(self, corridor):
+        if not hasattr(self, "drivable_corridor_pub"):
+            return
+        msg = Float32MultiArray()
+        msg.data = [
+            1.0 if corridor["corridor_valid"] else 0.0,
+            1.0 if corridor["bottom_connected"] else 0.0,
+            1.0 if corridor["centerline_reached"] else 0.0,
+            1.0 if corridor["upper_mid_reached"] else 0.0,
+            corridor["continuous_score"],
+            corridor["bottom_width_ratio"],
+            corridor["center_width_ratio"],
+            corridor["corridor_center_x_bottom"],
+            corridor["corridor_center_x_mid"],
+            corridor["corridor_center_x_centerline"],
+            corridor["corridor_error_x_pixels"],
+            corridor["corridor_slope_pixels"],
+            corridor["road_ratio_in_corridor"],
+            corridor["bridge_ratio_in_corridor"],
+            corridor["drivable_type"],
+            1.0 if corridor["side_view_likely"] else 0.0,
+            corridor["image_width"],
+            corridor["image_height"],
+            corridor["reason_code"],
+        ]
+        self.drivable_corridor_pub.publish(msg)
+
+    def publish_drivable_corridor_debug(self, corridor):
+        if not hasattr(self, "drivable_corridor_debug_pub"):
+            return
+        msg = String()
+        msg.data = (
+            f"valid={corridor['corridor_valid']} "
+            f"bottom_connected={corridor['bottom_connected']} "
+            f"centerline_reached={corridor['centerline_reached']} "
+            f"score={corridor['continuous_score']:.2f} "
+            f"bottom_width={corridor['bottom_width_ratio']:.2f} "
+            f"center_width={corridor['center_width_ratio']:.2f} "
+            f"error_x={corridor['corridor_error_x_pixels']:.1f} "
+            f"slope={corridor['corridor_slope_pixels']:.1f} "
+            f"type={corridor['drivable_type']:.0f} "
+            f"side_view={corridor['side_view_likely']} "
+            f"reason={corridor['reason']}"
+        )
+        self.drivable_corridor_debug_pub.publish(msg)
+
+    def _draw_drivable_corridor_overlay(self, image, corridor):
+        overlay = image.copy()
+        height, width = image.shape[:2]
+        component = corridor.get("component_mask")
+        if component is not None and component.shape[:2] == (height, width):
+            color = (0, 210, 255) if corridor["drivable_type"] != 2.0 else (255, 180, 0)
+            component_layer = np.zeros_like(image)
+            component_layer[component.astype(bool)] = color
+            overlay = cv2.addWeighted(overlay, 1.0, component_layer, 0.35, 0.0)
+
+        bands = corridor.get("bands", {})
+        for name, band_color in (
+            ("bottom", (0, 255, 255)),
+            ("lower", (255, 255, 0)),
+            ("center", (0, 255, 0)),
+        ):
+            if name not in bands:
+                continue
+            y0, y1 = bands[name]
+            cv2.rectangle(overlay, (0, int(y0)), (width - 1, max(int(y0), int(y1) - 1)), band_color, 1)
+
+        points = []
+        for key, y_key in (
+            ("corridor_center_x_bottom", "bottom"),
+            ("corridor_center_x_mid", "lower"),
+            ("corridor_center_x_centerline", "center"),
+        ):
+            x = corridor.get(key, 0.0)
+            band = bands.get(y_key)
+            if x > 0.0 and band is not None:
+                y = int((band[0] + band[1]) * 0.5)
+                point = (int(round(x)), y)
+                points.append(point)
+                cv2.circle(overlay, point, 5, (0, 0, 255), -1)
+        for first, second in zip(points, points[1:]):
+            cv2.line(overlay, first, second, (0, 0, 255), 2)
+
+        cv2.line(overlay, (width // 2, 0), (width // 2, height - 1), (255, 255, 255), 1)
+        text_lines = [
+            f"corridor valid={corridor['corridor_valid']} type={corridor['drivable_type']:.0f}",
+            f"err={corridor['corridor_error_x_pixels']:.0f}px score={corridor['continuous_score']:.2f}",
+            corridor["reason"],
+        ]
+        for index, text in enumerate(text_lines):
+            cv2.putText(
+                overlay,
+                text,
+                (12, 26 + index * 22),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 255, 255),
+                2,
+            )
+        return overlay
 
     def publish_segmentation_info(self, road_mask, bridge_mask, header=None):
         """
