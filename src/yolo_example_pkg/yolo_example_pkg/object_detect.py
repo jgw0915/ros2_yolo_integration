@@ -2006,13 +2006,30 @@ class YoloDetectionNode(Node):
         data layout:
         [target_found, bridge_found, bbox_bridge_overlap_ratio,
          bbox_lower_half_bridge_overlap_ratio, target_center_on_bridge,
-         target_bottom_center_on_bridge, image_width, image_height]
+         target_bottom_center_on_bridge, image_width, image_height,
+         target_left_side_bridge_contact, target_right_side_bridge_contact,
+         target_side_bridge_contact, target_side_bridge_contact_ratio,
+         target_side_bridge_contact_pixels]
         """
         msg = Float32MultiArray()
         height, width = bridge_mask.shape
         bridge_found = float(np.count_nonzero(bridge_mask) > 0)
         if target is None:
-            msg.data = [0.0, bridge_found, 0.0, 0.0, 0.0, 0.0, float(width), float(height)]
+            msg.data = [
+                0.0,
+                bridge_found,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                float(width),
+                float(height),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ]
             self.target_surface_pub.publish(msg)
             return
 
@@ -2023,6 +2040,11 @@ class YoloDetectionNode(Node):
         bbox_area = max(1, (x2 - x1) * (y2 - y1))
         bbox_bridge_overlap = 0.0
         lower_bridge_overlap = 0.0
+        left_side_contact = 0.0
+        right_side_contact = 0.0
+        side_contact = 0.0
+        side_contact_ratio = 0.0
+        side_contact_pixels = 0.0
 
         if x2 > x1 and y2 > y1:
             bbox_bridge_overlap = float(np.count_nonzero(bridge_mask[y1:y2, x1:x2]) / bbox_area)
@@ -2031,6 +2053,23 @@ class YoloDetectionNode(Node):
             lower_bridge_overlap = float(
                 np.count_nonzero(bridge_mask[lower_y1:y2, x1:x2]) / lower_area
             )
+            side_margin = max(2, int(width * 0.01))
+            left_x0 = max(0, x1 - side_margin)
+            left_x1 = min(width, x1 + side_margin + 1)
+            right_x0 = max(0, x2 - side_margin - 1)
+            right_x1 = min(width, x2 + side_margin)
+            side_y0 = y1
+            side_y1 = y2
+            left_area = max(1, (left_x1 - left_x0) * (side_y1 - side_y0))
+            right_area = max(1, (right_x1 - right_x0) * (side_y1 - side_y0))
+            left_pixels = int(np.count_nonzero(bridge_mask[side_y0:side_y1, left_x0:left_x1]))
+            right_pixels = int(np.count_nonzero(bridge_mask[side_y0:side_y1, right_x0:right_x1]))
+            side_contact_pixels = float(left_pixels + right_pixels)
+            side_contact_ratio = float(side_contact_pixels / max(1, left_area + right_area))
+            min_side_contact_pixels = max(3, int((side_y1 - side_y0) * 0.05))
+            left_side_contact = float(left_pixels >= min_side_contact_pixels)
+            right_side_contact = float(right_pixels >= min_side_contact_pixels)
+            side_contact = float(bool(left_side_contact or right_side_contact))
 
         center_x = max(0, min(width - 1, int(target.get("center_x", 0))))
         center_y = max(0, min(height - 1, int(target.get("center_y", 0))))
@@ -2048,6 +2087,11 @@ class YoloDetectionNode(Node):
             bottom_on_bridge,
             float(width),
             float(height),
+            left_side_contact,
+            right_side_contact,
+            side_contact,
+            side_contact_ratio,
+            side_contact_pixels,
         ]
         self.target_surface_pub.publish(msg)
 
