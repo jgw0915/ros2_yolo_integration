@@ -24,6 +24,7 @@ class YoloDetectionNode(Node):
         super().__init__("yolo_detection_node")
 
         self.declare_parameter("target_labels", ["bear", "knob"])
+        self.create_subscription(String, "/target_label", self._target_label_callback, 10)
         self.declare_parameter("conf_threshold", 0.5)
         self.declare_parameter("det_model_name", "best_object_detection.pt")
         self.declare_parameter("seg_model_name", "best_segmentation.pt")
@@ -85,7 +86,7 @@ class YoloDetectionNode(Node):
         self.latest_depth_frame_compressed = ""
 
         self.allowed_labels = {
-            label.strip()
+            label.strip().lower()
             for label in self.get_parameter("target_labels")
             .get_parameter_value()
             .string_array_value
@@ -289,6 +290,8 @@ class YoloDetectionNode(Node):
         self.locked_target = None
         self.lock_misses = 0
         self.current_frame_target = None
+        self.active_target_label = None
+        self.last_selected_target_class = None
         self.camera_info_received = False
         self.warned_missing_camera_info = False
         self.valid_depth_samples = 0
@@ -444,6 +447,22 @@ class YoloDetectionNode(Node):
     def _double_param(self, name):
         return self.get_parameter(name).get_parameter_value().double_value
 
+    def _normalize_target_label(self, label):
+        label = (label or "").strip().lower()
+        if label == "door_knob":
+            return "knob"
+        return label
+
+    def _target_label_callback(self, msg):
+        label = self._normalize_target_label(msg.data)
+        if label and label != self.active_target_label:
+            self.active_target_label = label
+            self.locked_target = None
+            self.lock_misses = 0
+            self.current_frame_target = None
+            self.last_selected_target_class = None
+            self.get_logger().info(f"Active YOLO target switched to: {label}")
+
     def camera_info_callback(self, msg):
         if len(msg.k) >= 9 and msg.k[0] > 0.0 and msg.k[4] > 0.0:
             self.bridge_camera_fx = float(msg.k[0])
@@ -586,10 +605,11 @@ class YoloDetectionNode(Node):
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 conf = float(box.conf)
                 class_id = int(box.cls[0])
-                class_name = self.det_model.names[class_id]
+                class_name = str(self.det_model.names[class_id]).strip()
+                normalized_class_name = class_name.lower()
 
                 # 只保留設定內的標籤；target_labels 空陣列時代表不過濾
-                if self.allowed_labels and class_name not in self.allowed_labels:
+                if self.allowed_labels and normalized_class_name not in self.allowed_labels:
                     continue
 
                 # 計算 Bounding Box 正中心點
@@ -599,24 +619,6 @@ class YoloDetectionNode(Node):
                 depth_value = self.get_depth_at(cx, cy)
                 depth_text = f"{depth_value:.2f}m" if depth_value > 0.0 else "N/A"
                 delta_x = cx - image_center_x
-                target_candidate = {
-                    "confidence": conf,
-                    "depth": depth_value,
-                    "delta_x": delta_x,
-                    "center_error": abs(delta_x),
-                    "has_valid_depth": depth_value > 0.0,
-                    "center_x": cx,
-                    "center_y": cy,
-                    "x1": x1,
-                    "y1": y1,
-                    "x2": x2,
-                    "y2": y2,
-                    "width": max(0, x2 - x1),
-                    "height": max(0, y2 - y1),
-                    "image_width": width,
-                    "image_height": height,
-                }
-                target_candidates.append(target_candidate)
 
                 # 根據 class_id 產生隨機但固定的顏色 (B, G, R)
                 rng = np.random.RandomState(class_id)
@@ -636,12 +638,46 @@ class YoloDetectionNode(Node):
                     2,
                 )
 
+                # Only the active task target can drive /yolo/target_*.
+                # If /target_label has not arrived yet, keep startup behavior.
+                if (
+                    self.active_target_label is not None
+                    and normalized_class_name != self.active_target_label
+                ):
+                    continue
+
+                target_candidate = {
+                    "class_name": normalized_class_name,
+                    "confidence": conf,
+                    "depth": depth_value,
+                    "delta_x": delta_x,
+                    "center_error": abs(delta_x),
+                    "has_valid_depth": depth_value > 0.0,
+                    "center_x": cx,
+                    "center_y": cy,
+                    "x1": x1,
+                    "y1": y1,
+                    "x2": x2,
+                    "y2": y2,
+                    "width": max(0, x2 - x1),
+                    "height": max(0, y2 - y1),
+                    "image_width": width,
+                    "image_height": height,
+                }
+                target_candidates.append(target_candidate)
+
         best_target = self._select_target(target_candidates)
         if best_target is not None:
             found_target = 1
             target_distance = best_target["depth"]
             delta_x = best_target["delta_x"]
             self.current_frame_target = dict(best_target)
+            selected_class = best_target.get("class_name", "")
+            if selected_class and selected_class != self.last_selected_target_class:
+                self.last_selected_target_class = selected_class
+                self.get_logger().info(
+                    f"Selected YOLO target for /yolo/target_info: {selected_class}"
+                )
         else:
             self.current_frame_target = None
 
@@ -706,6 +742,11 @@ class YoloDetectionNode(Node):
         return selected
 
     def _matches_locked_target(self, candidate):
+        locked_class = self.locked_target.get("class_name")
+        candidate_class = candidate.get("class_name")
+        if locked_class and candidate_class and locked_class != candidate_class:
+            return False
+
         center_distance = self._locked_center_distance(candidate)
         if center_distance > self.target_lock_max_pixel_distance:
             return False
