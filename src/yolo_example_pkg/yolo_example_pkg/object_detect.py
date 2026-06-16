@@ -23,7 +23,7 @@ class YoloDetectionNode(Node):
     def __init__(self):
         super().__init__("yolo_detection_node")
 
-        self.declare_parameter("target_labels", ["bear"])
+        self.declare_parameter("target_labels", ["bear", "knob"])
         self.declare_parameter("conf_threshold", 0.5)
         self.declare_parameter("det_model_name", "best_object_detection.pt")
         self.declare_parameter("seg_model_name", "best_segmentation.pt")
